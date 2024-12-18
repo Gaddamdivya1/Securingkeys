@@ -1,0 +1,122 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACCOUNT_ID', choices: ['533267138817'], description: 'Select AWS Account ID')
+        choice(name: 'VM_TYPE', choices: ['Linux'], description: 'Select Virtual Machine Type')
+        choice(name: 'SERVICE', choices: ['Nginx', 'Splunk'], description: 'Service to Restart')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        AWS_CREDENTIAL_ID = 'aws-credentials' 
+    }
+
+    stages {
+        stage('Authorize Account') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: "${AWS_CREDENTIAL_ID}", variable: 'AWS_SECRET_TEXT')]) {
+                        def awsKeys = AWS_SECRET_TEXT.split(',')
+                        if (awsKeys.length != 2) {
+                            error "Invalid AWS credential format. Ensure format: <AccessKey>,<SecretKey>"
+                        }
+
+                        def awsAccessKey = awsKeys[0]
+                        def awsSecretKey = awsKeys[1]
+
+                        withEnv([
+                            "AWS_ACCESS_KEY_ID=${awsAccessKey}",
+                            "AWS_SECRET_ACCESS_KEY=${awsSecretKey}"
+                        ]) {
+                            echo "Verifying AWS credentials for account: ${params.ACCOUNT_ID}"
+                            sh "aws sts get-caller-identity --region ${AWS_DEFAULT_REGION}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Fetch Instances Dynamically') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: "${AWS_CREDENTIAL_ID}", variable: 'AWS_SECRET_TEXT')]) {
+                        def awsKeys = AWS_SECRET_TEXT.split(',')
+                        def awsAccessKey = awsKeys[0]
+                        def awsSecretKey = awsKeys[1]
+
+                        withEnv([
+                            "AWS_ACCESS_KEY_ID=${awsAccessKey}",
+                            "AWS_SECRET_ACCESS_KEY=${awsSecretKey}"
+                        ]) {
+                            echo "Fetching running instances tagged '${params.SERVICE.toLowerCase()}'"
+
+                            def instanceIds = sh(script: """
+                                aws ec2 describe-instances \
+                                    --filters "Name=tag:Name,Values=${params.SERVICE.toLowerCase()}" "Name=instance-state-name,Values=running" \
+                                    --query 'Reservations[*].Instances[*].InstanceId' \
+                                    --output text --region ${AWS_DEFAULT_REGION}
+                            """, returnStdout: true).trim()
+
+                            if (instanceIds == "") {
+                                error "No running instances tagged '${params.SERVICE.toLowerCase()}' found."
+                            }
+
+                            echo "Fetched Instances: ${instanceIds}"
+                            env.INSTANCE_IDS = instanceIds
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Process Instances') {
+            steps {
+                script {
+                    def instanceList = env.INSTANCE_IDS?.split()
+                    if (!instanceList || instanceList.size() == 0) {
+                        error "No instances available to process."
+                    }
+
+                    withCredentials([string(credentialsId: "${AWS_CREDENTIAL_ID}", variable: 'AWS_SECRET_TEXT')]) {
+                        def awsKeys = AWS_SECRET_TEXT.split(',')
+                        def awsAccessKey = awsKeys[0]
+                        def awsSecretKey = awsKeys[1]
+
+                        withEnv([
+                            "AWS_ACCESS_KEY_ID=${awsAccessKey}",
+                            "AWS_SECRET_ACCESS_KEY=${awsSecretKey}"
+                        ]) {
+                            for (instanceId in instanceList) {
+                                echo "Restarting '${params.SERVICE}' service on instance: ${instanceId}"
+                                
+                                sh """
+                                    aws ssm send-command \
+                                        --document-name "AWS-RunShellScript" \
+                                        --targets "Key=instanceids,Values=${instanceId}" \
+                                        --parameters "commands=['sudo systemctl restart ${params.SERVICE.toLowerCase()}']" \
+                                        --timeout-seconds 600 \
+                                        --max-concurrency "50" \
+                                        --max-errors "0" \
+                                        --region ${AWS_DEFAULT_REGION}
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Pipeline execution complete!'
+        }
+        success {
+            echo 'Pipeline executed successfully.'
+        }
+        failure {
+            echo 'Pipeline execution failed. Check logs for details.'
+        }
+    }
+}
